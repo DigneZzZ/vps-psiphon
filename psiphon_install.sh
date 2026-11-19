@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vps-psiphon — Psiphon egress for an xray/remnawave node.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh)
+# For installation commands and supported platforms, see README.md.
 #
 # The tunnel runs as a container; its SOCKS5 is published on a host-private address
 # and handed to xray through a four-line outbound. systemd owns the lifecycle, and a
@@ -26,17 +26,19 @@
 # `vps-psiphon uninstall` removes all of those, the container, the image and itself.
 set -euo pipefail
 
-VERSION=1.3
-IMAGE="${IMAGE:-swarupsengupta2007/psiphon:latest}"
+VERSION=1.4.0
+IMAGE_DEFAULT=swarupsengupta2007/psiphon:latest
+IMAGE="${IMAGE:-}"
 INSTANCE=1
 # Chosen after preflight: the default address exists only once docker is running.
 BIND="${BIND:-}"
+BIND_NETWORK=""
 
 EGRESS_REGION="${EGRESS_REGION:-}"
 REGION_POOL=""; REGION_POOL_SET=0
 DEVICE_REGION="${DEVICE_REGION:-}"
-WATCHDOG=1
-PUBLISH_HTTP=1
+WATCHDOG=1; WATCHDOG_SET=0
+PUBLISH_HTTP=0
 # Where Google withholds service, plus CN, which blocks Google itself. Checked first
 # and in every mode; a false positive costs one rotation.
 DENY_REGIONS_DEFAULT="RU BY IR SY CU KP CN VE"
@@ -68,11 +70,12 @@ psiphon_install.sh $VERSION [options]
                        and its ports default to 1080+N-1 and 8080+N-1.
   --socks-port N       SOCKS5 port for xray, default 1080. Refused if taken —
                        xray's outbound names this port, so it is never moved.
-  --http-port N        HTTP proxy port, default 8080. Nothing here consumes it,
-                       so a taken default moves to the next free port; a port
-                       you name explicitly is refused instead.
-  --no-http            do not publish the HTTP proxy. Remembered across reinstalls
-  --http               publish it after all — undoes a stored --no-http
+  --http-port N        HTTP proxy port, default 8080. Applies only with HTTP
+                       enabled. A taken default moves to a free port.
+                       An explicitly selected port is refused if taken.
+  --no-http            do not publish HTTP (default for new instances)
+  --http               publish HTTP as well as SOCKS. Existing choice is preserved
+                       unless either switch is supplied
   --deny-regions 'CC…' countries the exit must never be in, space or comma
                        separated. Default: RU BY IR SY CU KP CN VE. Checked in
                        every mode, before anything else. Empty disables it.
@@ -93,21 +96,27 @@ psiphon_install.sh $VERSION [options]
                        through this tunnel while www.google.com does not — there
                        that captcha cannot be solved. Remembered across reinstalls
   --no-impersonate     turn it off again and remove curl-impersonate
-  --bind ADDR         host address to publish the SOCKS5 on. Default: the
-                       docker0 gateway (usually 172.17.0.1), where the kernel
-                       DNATs the traffic. On loopback it cannot, and docker-proxy
-                       copies every byte in userspace instead — 0.10 of a core
-                       sustained on a busy node. Any address is accepted, a
-                       public one included; its access control is then yours.
-  --bind-loopback      publish on 127.0.0.1 instead: narrower (containers on the
-                       default bridge cannot reach it), at the price of that
-                       userspace copy. Neither default is reachable from outside.
+  --bind IPV4          publish the proxy on this IPv4 address on the local host
+  --bind-docker NAME   use the IPv4 gateway of this Docker bridge network
+  --bind-loopback      publish on 127.0.0.1 for a host-network client
+                       Without a bind option, keep the previous address, or on
+                       a fresh install use the default bridge IPv4 or 127.0.0.1.
   --image REF          container image, default swarupsengupta2007/psiphon:latest
-  --no-watchdog        skip the watchdog
+  --no-watchdog        disable the watchdog timer
+  --watchdog           enable the watchdog timer (default on fresh installs)
+  --version            print the installer version
 U
 }
 
+say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
 while [ $# -gt 0 ]; do
+  case "$1" in
+    --region|--device-region|--instance|--socks-port|--http-port|--deny-regions|--bulk-test-mb|--tunnel-pool|--bind|--bind-docker|--image)
+      [ "$#" -ge 2 ] && [[ "$2" != --* ]] || die "$1 requires a value"
+      ;;
+  esac
   case "$1" in
     --region)
       REGION_POOL="$(printf '%s' "${2:-}" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
@@ -131,17 +140,17 @@ while [ $# -gt 0 ]; do
       TUNNEL_POOL="$2"; TUNNEL_POOL_SET=1; shift 2 ;;
     --impersonate)    IMPERSONATE=1; IMPERSONATE_SET=1; shift ;;
     --no-impersonate) IMPERSONATE=0; IMPERSONATE_SET=1; shift ;;
-    --bind)          BIND="${2:?}";          shift 2 ;;
-    --bind-loopback) BIND=127.0.0.1;         shift   ;;
+    --bind)          BIND="${2:?}"; BIND_NETWORK=""; shift 2 ;;
+    --bind-docker)   BIND_NETWORK="${2:?}"; BIND=""; shift 2 ;;
+    --bind-loopback) BIND=127.0.0.1; BIND_NETWORK=""; shift ;;
     --image)         IMAGE="${2:?}";         shift 2 ;;
-    --no-watchdog)   WATCHDOG=0;             shift   ;;
+    --no-watchdog)   WATCHDOG=0; WATCHDOG_SET=1; shift ;;
+    --watchdog)      WATCHDOG=1; WATCHDOG_SET=1; shift ;;
+    --version)       printf '%s\n' "$VERSION"; exit 0 ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
-
-say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- instance --
 # Every name derives from the prefix, so two instances share nothing but the image.
@@ -152,43 +161,147 @@ case "$INSTANCE" in
   *) die "--instance takes a number from 1 to 99" ;;
 esac
 if [ "$INSTANCE" = 1 ]; then P=vps-psiphon; else P="vps-psiphon-$INSTANCE"; fi
-NAME="${NAME:-$P}"
 CONF_DIR="/opt/$P/config"
 ENVF="/etc/default/$P"
 # A second instance must not reach for the first one's ports; a port given with a flag
 # or kept from a previous install of this instance still wins.
 SOCKS_PORT="${SOCKS_PORT:-$((1079 + INSTANCE))}"
 HTTP_PORT="${HTTP_PORT:-$((8079 + INSTANCE))}"
-if [ "$INSTANCE" = 1 ]; then OUT_TAG=psiphon-out; else OUT_TAG="psiphon-out-$INSTANCE"; fi
 
-# Writes stdin to $1 with @P@ replaced by the prefix. The scripts below stay in quoted
-# heredocs — nothing in them expands at install time — and only the prefix is filled in.
-put() { sed "s/@P@/$P/g" > "$1"; }
+# Generate each script or unit in the same directory, then replace it atomically.
+put() {
+  local path="$1" mode=0644 tmp
+  if [[ "$path" == /usr/local/sbin/* ]]; then mode=0755; fi
+  tmp="$(mktemp "${path}.XXXXXX")"
+  if ! sed "s/@P@/$P/g" > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    die "could not write $path"
+  fi
+}
+
+# Read the installer-owned file as data. The running services source this file.
+saved() {
+  [ -r "$ENVF" ] || return 0
+  sed -n "s/^$1=//p" "$ENVF" | sed -n '1p'
+}
+port_number() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
+}
+ipv4() {
+  local a b c d octet
+  [[ "$1" =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+  IFS=. read -r a b c d <<< "$1"
+  for octet in "$a" "$b" "$c" "$d"; do
+    [ "$octet" -le 255 ] || return 1
+  done
+}
+region_list() {
+  [[ -z "$1" || "$1" =~ ^[A-Z]{2}(\ [A-Z]{2})*$ ]]
+}
 
 # ---------------------------------------------------------------- preflight --
+[ "$(uname -s)" = Linux ] || die "run on the Linux Docker host"
 [ "$(id -u)" = 0 ] || die "run as root"
-command -v docker >/dev/null || die "docker is not installed"
-docker info >/dev/null 2>&1 || die "docker daemon is not running"
-command -v curl >/dev/null || die "curl is not installed"
+for command in docker curl ip ss jq flock systemctl journalctl; do
+  command -v "$command" >/dev/null || die "$command is not installed"
+done
+systemctl show --property=Version --value >/dev/null 2>&1 ||
+  die "a running systemd instance is required"
+DOCKER_ENDPOINT="${DOCKER_HOST:-}"
+if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "$DOCKER_ENDPOINT" ]; then
+  DOCKER_ENDPOINT="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" ||
+    die "could not resolve the Docker endpoint"
+fi
+case "$DOCKER_ENDPOINT" in
+  unix:///var/run/docker.sock|unix:///run/docker.sock) ;;
+  *) die "the installer requires the local Docker daemon at /run/docker.sock" ;;
+esac
+# Use the same endpoint in the installer, services and management commands.
+unset DOCKER_CONTEXT
+export DOCKER_HOST="$DOCKER_ENDPOINT"
+docker info >/dev/null 2>&1 || die "the local Docker daemon is not available"
+exec 9>/run/vps-psiphon.install.lock
+flock -n 9 || die "another vps-psiphon installer is running"
+
+OLD_BIND="$(saved BIND)"
+OLD_REGION="$(saved EGRESS_REGION)"
+OLD_SOCKS_PORT="$(saved SOCKS_PORT)"
+NAME="${NAME:-$(saved NAME)}"
+NAME="${NAME:-$P}"
+IMAGE="${IMAGE:-$(saved IMAGE)}"
+IMAGE="${IMAGE:-$IMAGE_DEFAULT}"
+DEVICE_REGION="${DEVICE_REGION:-$(saved DEVICE_REGION)}"
+if [ "$REGION_POOL_SET" = 0 ]; then
+  EGRESS_REGION="${EGRESS_REGION:-$OLD_REGION}"
+  REGION_POOL="$(saved REGION_POOL | tr -d "'")"
+fi
+if [ "$DENY_REGIONS_SET" = 0 ]; then
+  if [ -r "$ENVF" ] && grep -q '^DENY_REGIONS=' "$ENVF"; then
+    DENY_REGIONS="$(saved DENY_REGIONS | tr -d "'")"
+  else
+    DENY_REGIONS="$DENY_REGIONS_DEFAULT"
+  fi
+fi
+if [ "$BULK_TEST_SET" = 0 ]; then
+  BULK_TEST_MB="$(saved BULK_TEST_MB)"
+  BULK_TEST_MB="${BULK_TEST_MB:-4}"
+fi
+if [ "$TUNNEL_POOL_SET" = 0 ]; then
+  TUNNEL_POOL="$(saved TUNNEL_POOL_SIZE)"
+  TUNNEL_POOL="${TUNNEL_POOL:-1}"
+fi
+MIN_THROUGHPUT="$(saved MIN_THROUGHPUT_KBPS)"
+MIN_THROUGHPUT="${MIN_THROUGHPUT:-800}"
+FAIL_THRESHOLD="$(saved FAIL_THRESHOLD)"
+FAIL_THRESHOLD="${FAIL_THRESHOLD:-2}"
+
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "invalid Docker container name: $NAME"
+[[ "$IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$ ]] || die "invalid Docker image reference: $IMAGE"
+[[ -z "$EGRESS_REGION" || "$EGRESS_REGION" =~ ^[A-Z]{2}$ ]] ||
+  die "--region requires uppercase two-letter codes"
+region_list "$REGION_POOL" || die "--region requires uppercase two-letter codes separated by commas"
+region_list "$DENY_REGIONS" || die "--deny-regions requires uppercase two-letter codes"
+[[ -z "$DEVICE_REGION" || "$DEVICE_REGION" =~ ^[A-Z]{2}$ ]] ||
+  die "--device-region requires an uppercase two-letter code"
+[[ "$BULK_TEST_MB" =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "invalid BULK_TEST_MB: $BULK_TEST_MB"
+[[ "$TUNNEL_POOL" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || die "invalid TUNNEL_POOL_SIZE: $TUNNEL_POOL"
+[[ "$MIN_THROUGHPUT" =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "invalid MIN_THROUGHPUT_KBPS: $MIN_THROUGHPUT"
+[[ "$FAIL_THRESHOLD" =~ ^[1-9][0-9]{0,5}$ ]] || die "invalid FAIL_THRESHOLD: $FAIL_THRESHOLD"
 
 # ------------------------------------------------------------- bind address --
-# Docker writes a DNAT rule per published port, but a loopback destination needs
-# route_localnet, which docker does not set — so on 127.0.0.1 that rule never fires and
-# docker-proxy carries everything in userspace. The docker0 gateway has no such cost.
-# Both lookups end in `|| true`: under `set -e` a missing `ip` would kill the install
-# before it reaches the fallback.
-docker_gateway() {
-  local g=""
-  g="$(ip -4 -o addr show docker0 2>/dev/null \
-       | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
-  [ -n "$g" ] || g="$(docker network inspect bridge \
-                      -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)"
-  printf '%s' "$g"
+local_ipv4() {
+  ip -o -4 addr show | awk -v addr="$1" '{
+    split($4, parts, "/")
+    if (parts[1] == addr) present = 1
+  } END { exit !present }'
 }
-if [ -z "$BIND" ]; then
-  BIND="$(docker_gateway)"
-  [ -n "$BIND" ] || BIND=127.0.0.1   # no docker0: loopback still works
+
+docker_gateway() {
+  local spec driver addr
+  spec="$(docker network inspect --format '{{.Driver}}{{range .IPAM.Config}}{{printf "\n%s" .Gateway}}{{end}}' -- "$1" 2>/dev/null)" ||
+    return 1
+  {
+    read -r driver
+    [ "$driver" = bridge ] || return 1
+    while IFS= read -r addr; do
+      if ipv4 "$addr" && [ "$addr" != 0.0.0.0 ] && local_ipv4 "$addr"; then
+        printf '%s\n' "$addr"
+        return 0
+      fi
+    done
+  } <<< "$spec"
+  return 1
+}
+
+if [ -n "$BIND_NETWORK" ]; then
+  BIND="$(docker_gateway "$BIND_NETWORK")" ||
+    die "Docker bridge '$BIND_NETWORK' has no IPv4 gateway on this host"
+elif [ -z "$BIND" ]; then
+  BIND="$OLD_BIND"
+  [ -n "$BIND" ] || BIND="$(docker_gateway bridge || printf '127.0.0.1\n')"
 fi
+ipv4 "$BIND" && [ "$BIND" != 0.0.0.0 ] || die "--bind requires a specific IPv4 address"
+local_ipv4 "$BIND" || die "IPv4 address '$BIND' is not configured on this host"
 
 # --------------------------------------------------------- port arbitration --
 # Docker allocates host ports only when the container starts, so an unchecked
@@ -220,7 +333,7 @@ port_conflict() {
     case "$label" in
       docker-proxy*)
         ct="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
-              | awk -v pat=":$port->" 'index($0, pat) { print $1; exit }')"
+              | awk -v pat="$addr:$port->" 'index($0, " " pat) || index($0, ", " pat) { print $1; exit }')"
         [ -n "$ct" ] && label="container '$ct'"
         ;;
     esac
@@ -235,29 +348,40 @@ EOF
 # First port at or above $1 that is free for a bind on $2.
 free_port() {
   local port="$1" bind="$2" tries=0
-  while [ "$tries" -lt 100 ]; do
-    port_conflict "$port" "$bind" >/dev/null || { printf '%s\n' "$port"; return 0; }
+  while [ "$tries" -lt 100 ] && [ "$port" -le 65535 ]; do
+    [ "$port" = "$SOCKS_PORT" ] ||
+      port_conflict "$port" "$bind" >/dev/null || { printf '%s\n' "$port"; return 0; }
     port=$((port + 1)); tries=$((tries + 1))
   done
   return 1
 }
 
-# Ports and the HTTP decision settled on an earlier run survive a reinstall — otherwise
-# the HTTP port drifts one higher every run, and a reset SOCKS port leaves the panel's
-# outbound dialing nothing. An explicit flag always wins.
+# Use saved ports and proxy/watchdog choices unless overridden.
 if [ -r "$ENVF" ]; then
   if [ "$SOCKS_PORT_SET" = 0 ]; then
-    V="$(sed -n 's/^SOCKS_PORT=//p' "$ENVF" | head -1)"; [ -n "$V" ] && SOCKS_PORT="$V"
+    [ -n "$OLD_SOCKS_PORT" ] && SOCKS_PORT="$OLD_SOCKS_PORT"
   fi
   if [ "$HTTP_PORT_SET" = 0 ]; then
-    V="$(sed -n 's/^HTTP_PORT=//p' "$ENVF" | head -1)"; [ -n "$V" ] && HTTP_PORT="$V"
+    V="$(saved HTTP_PORT)"; [ -n "$V" ] && HTTP_PORT="$V"
   fi
   if [ "$PUBLISH_HTTP_SET" = 0 ]; then
-    V="$(sed -n 's/^PUBLISH_HTTP=//p' "$ENVF" | head -1)"; [ -n "$V" ] && PUBLISH_HTTP="$V"
+    V="$(saved PUBLISH_HTTP)"; PUBLISH_HTTP="${V:-1}"
   fi
   if [ "$IMPERSONATE_SET" = 0 ]; then
-    V="$(sed -n 's/^IMPERSONATE=//p' "$ENVF" | head -1)"; [ -n "$V" ] && IMPERSONATE="$V"
+    V="$(saved IMPERSONATE)"; [ -n "$V" ] && IMPERSONATE="$V"
   fi
+  if [ "$WATCHDOG_SET" = 0 ]; then
+    WATCHDOG=0
+    if systemctl is-enabled --quiet "$P-watchdog.timer"; then WATCHDOG=1; fi
+  fi
+fi
+
+port_number "$SOCKS_PORT" || die "--socks-port must be an integer from 1 to 65535"
+port_number "$HTTP_PORT" || die "--http-port must be an integer from 1 to 65535"
+[[ "$PUBLISH_HTTP" =~ ^[01]$ ]] || die "invalid PUBLISH_HTTP: $PUBLISH_HTTP"
+[[ "$IMPERSONATE" =~ ^[01]$ ]] || die "invalid IMPERSONATE: $IMPERSONATE"
+if [ "$PUBLISH_HTTP" = 1 ] && [ "$HTTP_PORT" = "$SOCKS_PORT" ]; then
+  die "SOCKS and HTTP cannot use the same published port"
 fi
 
 # On a reinstall our own container holds the port — that is not a conflict.
@@ -301,8 +425,7 @@ if [ -n "$XRAY_CT" ] && [ "$BIND" = "127.0.0.1" ]; then
     echo
     echo "  !! container '$XRAY_CT' runs with NetworkMode=$NETMODE, not host."
     echo "     127.0.0.1:$SOCKS_PORT will NOT be reachable from xray."
-    echo "     Drop --bind-loopback: the default gateway address is reachable"
-    echo "     from both, and needs no change to that container."
+    echo "     Use --bind-docker with the bridge network attached to this container."
     echo
   fi
 fi
@@ -322,6 +445,12 @@ fi
 
 if [ "$PUBLISH_HTTP" = 1 ]; then HTTP_DESC="$BIND:$HTTP_PORT"; else HTTP_DESC="not published"; fi
 say "vps-psiphon $VERSION  image=$IMAGE  egress=${EGRESS_REGION:-auto}  device=$DEVICE_REGION  socks=$BIND:$SOCKS_PORT  http=$HTTP_DESC"
+
+# Pull before replacing any service files or clearing the saved configuration.
+say "pulling image"
+docker pull -q "$IMAGE" >/dev/null
+docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null \
+  | sed 's/^/    deployed digest: /' || true
 
 # --------------------------------------------------------- curl-impersonate --
 # With --impersonate the Gemini check fetches its page with a browser's TLS handshake.
@@ -435,38 +564,19 @@ fi
 
 # ------------------------------------------------------------------ install --
 mkdir -p "$CONF_DIR"
-# A changed region also drops the client's cached servers, as `vps-psiphon region` does.
-OLD_REGION="__none__"
-[ -r "$ENVF" ] && OLD_REGION="$(sed -n 's/^EGRESS_REGION=//p' "$ENVF")"
-if [ "$OLD_REGION" != "__none__" ] && [ "$OLD_REGION" != "$EGRESS_REGION" ]; then
-  say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: clearing cached config"
-  rm -rf "${CONF_DIR:?}"/*
+# Keep the watchdog from rotating while the installer writes files and restarts.
+if [ -r "$ENVF" ]; then
+  for unit in "$P-watchdog.timer" "$P-watchdog.service" "$P.service"; do
+    if [ "$(systemctl show -p LoadState --value "$unit")" != not-found ]; then
+      systemctl stop "$unit"
+    fi
+  done
+  if [ "$OLD_REGION" != "$EGRESS_REGION" ]; then
+    say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: clearing cached config"
+    rm -rf "${CONF_DIR:?}"/*
+  fi
 fi
 chown -R 1000:1000 "$CONF_DIR"
-
-# Preserve operator-set values across a reinstall. The deny-list is tracked as
-# set-or-not, not by value: a deliberately emptied one must stay empty.
-OLD_MIN_THROUGHPUT=""; OLD_REGION_POOL=""; OLD_BULK_TEST=""; OLD_TUNNEL_POOL=""
-OLD_DENY_SET=0; OLD_DENY_REGIONS=""
-if [ -r "$ENVF" ] && grep -q '^DENY_REGIONS=' "$ENVF"; then
-  OLD_DENY_SET=1
-  OLD_DENY_REGIONS="$(sed -n 's/^DENY_REGIONS=//p' "$ENVF" | tr -d "'")"
-fi
-if [ "$DENY_REGIONS_SET" = 0 ]; then
-  if [ "$OLD_DENY_SET" = 1 ]; then DENY_REGIONS="$OLD_DENY_REGIONS"
-  else DENY_REGIONS="$DENY_REGIONS_DEFAULT"; fi
-fi
-if [ -r "$ENVF" ]; then
-  OLD_MIN_THROUGHPUT="$(sed -n 's/^MIN_THROUGHPUT_KBPS=//p' "$ENVF")"
-  OLD_BULK_TEST="$(sed -n 's/^BULK_TEST_MB=//p' "$ENVF")"
-  # 8 was the default until it halved to 4; only a value set by hand is kept.
-  [ "$OLD_BULK_TEST" = 8 ] && OLD_BULK_TEST=""
-  OLD_TUNNEL_POOL="$(sed -n 's/^TUNNEL_POOL_SIZE=//p' "$ENVF")"
-  OLD_REGION_POOL="$(sed -n 's/^REGION_POOL=//p' "$ENVF" | tr -d "'")"
-  [ "$REGION_POOL_SET" = 1 ] || REGION_POOL="$OLD_REGION_POOL"
-fi
-[ "$BULK_TEST_SET" = 1 ] || BULK_TEST_MB="${OLD_BULK_TEST:-4}"
-[ "$TUNNEL_POOL_SET" = 1 ] || TUNNEL_POOL="${OLD_TUNNEL_POOL:-1}"
 
 # A country both requested and denied rotates forever.
 for r in ${EGRESS_REGION:-} ${REGION_POOL:-}; do
@@ -477,8 +587,6 @@ done
 
 # A moved address leaves the panel's outbound dialing one nobody listens on — a tunnel
 # that reads healthy and carries nothing. Warned here and again beside the outbound.
-OLD_BIND=""
-[ -r "$ENVF" ] && OLD_BIND="$(sed -n 's/^BIND=//p' "$ENVF")"
 BIND_CHANGED=0
 if [ -n "$OLD_BIND" ] && [ "$OLD_BIND" != "$BIND" ]; then
   BIND_CHANGED=1
@@ -490,14 +598,18 @@ if [ -n "$OLD_BIND" ] && [ "$OLD_BIND" != "$BIND" ]; then
   echo
 fi
 
-# Unquoted heredoc, for the values — so nothing below may contain a backtick or a
-# dollar sign that is not meant to expand.
-cat > "$ENVF" <<EOF
+# All substituted values have been validated; use an atomic 0600 file because the
+# launcher and watchdog source it even while an installer might be running.
+ENV_TMP="$(mktemp "${ENVF}.XXXXXX")"
+cat > "$ENV_TMP" <<EOF
 # $P — written by psiphon_install.sh $VERSION
 #
 # NOTE: this file is sourced by the shell, so any value containing spaces MUST be
 # quoted. Unquoted, everything after the first space is run as a command.
 IMAGE=$IMAGE
+# Use the Docker daemon verified during installation.
+unset DOCKER_CONTEXT
+export DOCKER_HOST=$DOCKER_ENDPOINT
 NAME=$NAME
 BIND=$BIND
 SOCKS_PORT=$SOCKS_PORT
@@ -513,7 +625,7 @@ CONF_DIR=$CONF_DIR
 # is hard to win back. There is no cooldown: the count starts at zero after a rotation,
 # so a slow tunnel always gets two checks. A cooldown could only delay a rotation, never
 # prevent one, and the exit it held was a known-bad one.
-FAIL_THRESHOLD=2
+FAIL_THRESHOLD=$FAIL_THRESHOLD
 # Countries to rotate through, space separated; empty keeps rotations inside
 # EGRESS_REGION. A retry then draws on another country's servers.
 REGION_POOL='$REGION_POOL'
@@ -526,7 +638,7 @@ DENY_REGIONS='$DENY_REGIONS'
 # none would have rotated at 800, the slowest twice at 1000 — while a real collapse
 # trips it on the second check at 600 and at 1000 alike. Lower it only for a node whose
 # own history shows it cannot reach it.
-MIN_THROUGHPUT_KBPS=${OLD_MIN_THROUGHPUT:-800}
+MIN_THROUGHPUT_KBPS=$MIN_THROUGHPUT
 # Size, MB, of the watchdog's throughput download — part of a large file on Google's own
 # download host. A busy tunnel queues: every first byte waits, seconds at times, while a
 # download that is already flowing still runs fast. A page smaller than one connection's
@@ -553,12 +665,7 @@ TUNNEL_POOL_SIZE=$TUNNEL_POOL
 # remove the build.
 IMPERSONATE=$IMPERSONATE
 EOF
-chmod 600 "$ENVF"
-
-say "pulling image"
-docker pull -q "$IMAGE" >/dev/null
-docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null \
-  | sed 's/^/    deployed digest: /' || true
+mv -f "$ENV_TMP" "$ENVF"
 
 # ---- launcher ---------------------------------------------------------------
 put "/usr/local/sbin/$P-run" <<'RUN'
@@ -566,69 +673,50 @@ put "/usr/local/sbin/$P-run" <<'RUN'
 # Foreground container launcher; systemd owns the lifecycle.
 set -euo pipefail
 . /etc/default/@P@
+if [ "${1:-}" = --stop ]; then
+  exec docker stop -t 10 "$NAME"
+fi
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+# Reject an empty or wildcard address even when the operator edits the env file.
+case "${BIND:-}" in ''|0.0.0.0|::*|*[!0-9.]*) echo "Invalid IPv4 proxy bind: ${BIND:-empty}" >&2; exit 1 ;; esac
 
-# Psiphon's window per connection, in 32 KB blocks. Its default, 4 (128 KB), caps one
-# connection at about a window per round trip — ~20 Mbit/s over a 30 ms tunnel, however
-# idle the tunnel is. 32 (1 MB) measured 5-14x faster per connection with no added wait
-# for a small request behind eight downloads; 64 and 128 began to delay it.
-WINDOW=32
-cfg="${CONF_DIR}/psiphon.config"
-# The image writes psiphon.config only when it is absent, from its template plus the
-# ports and regions. Seeded here from the same template, so the first tunnel after an
-# install or `region` carries the window too; the regions are written below, on every
-# start. If the template cannot be read, the image seeds the file as before and the
-# window and the regions apply from the next start.
-if [ ! -f "$cfg" ] &&
-   docker run --rm --entrypoint cat "$IMAGE" /etc/psiphon/psiphon.config > "$cfg.new" 2>/dev/null &&
-   [ -s "$cfg.new" ]; then
-  sed -i -E \
-    -e "s/\"LocalHttpProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalHttpProxyPort\": ${HTTP_PORT}/" \
-    -e "s/\"LocalSocksProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalSocksProxyPort\": ${SOCKS_PORT}/" \
-    "$cfg.new"
-  mv "$cfg.new" "$cfg"
+cfg="$CONF_DIR/psiphon.config"
+tmp="$(mktemp "$CONF_DIR/.psiphon.XXXXXX")"
+seed=""
+trap 'rm -f "$tmp" "${seed:-}"' EXIT
+src="$cfg"
+# The image also seeds its own config on first start. Read its template here so
+# the configured region, ports and tunnel parameters apply on the first start.
+if [ ! -f "$cfg" ]; then
+  seed="$(mktemp "$CONF_DIR/.psiphon-seed.XXXXXX")"
+  docker run --rm --entrypoint cat "$IMAGE" /etc/psiphon/psiphon.config > "$seed"
+  src="$seed"
 fi
-rm -f "$cfg.new"
-# A numeric top-level key: replaced where present, inserted after the opening brace if not.
-setkey() {
-  if grep -q "\"$1\"" "$cfg"; then
-    sed -i -E "s/\"$1\"[[:space:]]*:[[:space:]]*[0-9]+/\"$1\": $2/" "$cfg"
-  else
-    sed -i "0,/{/s/{/{\n \"$1\": $2,/" "$cfg"
-  fi
-}
-# A top-level key this launcher owns, kept on one line: its earlier line is dropped and
-# the current value inserted after the opening brace.
-setline() {
-  sed -i "/^ *\"$1\": .*,\$/d" "$cfg"
-  sed -i "0,/{/s/{/{\n \"$1\": $2,/" "$cfg"
-}
-if [ -f "$cfg" ]; then
-  setkey SSHChannelWindowSize "$WINDOW"
-  # How many tunnels the client keeps at once; written every start, so a changed
-  # TUNNEL_POOL_SIZE applies from the next restart without clearing the server list.
-  setkey TunnelPoolSize "${TUNNEL_POOL_SIZE:-1}"
-  # The regions, from the env file on every start. The image's template carries "SG"
-  # and "IN", and the image replaces them only with a value that is not empty, so an
-  # empty EGRESS_REGION — auto — exited through Singapore. Psiphon reads an empty value
-  # as any country.
-  setline EgressRegion "\"${EGRESS_REGION:-}\""
-  setline DeviceRegion "\"${DEVICE_REGION:-}\""
-  # Psiphon's servers send every client tactics: settings for the client's network,
-  # applied on top of this file. They put in-proxy first: the first ten dials of every
-  # tunnel go through a volunteer's device over WebRTC, which is built for users whose
-  # networks block Psiphon's servers. An exit carries a whole host's traffic, and through
-  # a volunteer's link such a tunnel almost always died within minutes or crawled at a
-  # few hundred KB/s — a lottery on the volunteer's link, with few winning tickets — while
-  # a direct one carried megabytes a second for hours; each rotation drew in-proxy again. Tactics override this file, so the switch that holds is to turn them
-  # off. The protocol limit then stands: what Psiphon itself offered, minus in-proxy.
-  setline DisableTactics true
-  setline LimitTunnelProtocols '["SSH", "OSSH", "QUIC-OSSH", "TLS-OSSH", "SHADOWSOCKS-OSSH", "UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH"]'
-  # Diagnostic notices are left at Psiphon's default, off. They are the only notices that
-  # name a tunnel's protocol, but on a busy exit they ran to some 25 MB a day, nearly all
-  # of it one line per failed user connection; the watchdog reads the protocol from the
-  # client's own store instead.
-fi
+# Patch only keys owned by this launcher. Writing real JSON avoids duplicate
+# keys and keeps the listener ports synchronized with Docker on every restart.
+jq -es \
+  --argjson socks "$SOCKS_PORT" --argjson http "$HTTP_PORT" \
+  --argjson publish_http "${PUBLISH_HTTP:-1}" --argjson pool "${TUNNEL_POOL_SIZE:-1}" \
+  --arg egress "${EGRESS_REGION:-}" --arg device "${DEVICE_REGION:-}" '
+    if length != 1 or (.[0] | type) != "object" then error("expected one Psiphon config object") else
+      .[0] |
+      .LocalSocksProxyPort = $socks |
+      .LocalHttpProxyPort = $http |
+      .DisableLocalHTTPProxy = ($publish_http == 0) |
+      .SSHChannelWindowSize = 32 |
+      .TunnelPoolSize = $pool |
+      .EgressRegion = $egress |
+      .DeviceRegion = $device |
+      .DisableTactics = true |
+      .LimitTunnelProtocols = ["SSH", "OSSH", "QUIC-OSSH", "TLS-OSSH",
+        "SHADOWSOCKS-OSSH", "UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
+        "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH"]
+    end
+  ' "$src" > "$tmp"
+chown 1000:1000 "$tmp"
+mv -f "$tmp" "$cfg"
+rm -f "${seed:-}"
+trap - EXIT
 
 # The BIND prefix is load-bearing: psiphon listens on 0.0.0.0 inside the container,
 # so publishing without it exposes an OPEN SOCKS5 PROXY to the internet.
@@ -642,7 +730,6 @@ exec docker run --rm --name "$NAME" \
   -v "${CONF_DIR}:/config" \
   "$IMAGE"
 RUN
-chmod 755 "/usr/local/sbin/$P-run"
 
 # ---- orphaned-proxy sweeper -------------------------------------------------
 put "/usr/local/sbin/$P-prestart" <<'PRE'
@@ -711,7 +798,6 @@ else
 fi
 exit 0
 PRE
-chmod 755 "/usr/local/sbin/$P-prestart"
 
 # ---- region pool ------------------------------------------------------------
 put "/usr/local/sbin/$P-advance-region" <<'ADV'
@@ -739,7 +825,6 @@ done
 sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$nxt/" "$ENVF"
 printf '%s -> %s\n' "${cur:-auto}" "$nxt"
 ADV
-chmod 0755 "/usr/local/sbin/$P-advance-region"
 
 # ---- gemini check -----------------------------------------------------------
 put "/usr/local/sbin/$P-gemini-check" <<'GEM'
@@ -763,15 +848,15 @@ put "/usr/local/sbin/$P-gemini-check" <<'GEM'
 #             tell a burned exit apart from a refusal that follows the whole host.
 set -uo pipefail
 [ -r /etc/default/@P@ ] && . /etc/default/@P@
-P=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT:-1080}")
-[ "${1:-}" = --direct ] && P=(-4)
+P=(--noproxy "" --socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT:-1080}")
+[ "${1:-}" = --direct ] && P=(-4 --noproxy "*")
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
 d="$(mktemp -d)" || { echo "inconclusive (no temp dir)"; exit 2; }
 trap 'rm -rf "$d"' EXIT
 C=(-s "${P[@]}" -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' -b "$d/jar" -c "$d/jar")
 
 # The browser build sends its own coherent headers, so it gets no -A or -H of ours.
-G=(curl "${C[@]}"); imp=0; note=""
+G=(curl -q "${C[@]}"); imp=0; note=""
 if [ "${IMPERSONATE:-0}" = 1 ]; then
   ci=/opt/@P@/curl-impersonate
   n="$(ls "$ci" 2>/dev/null | sed -n 's/^curl_chrome\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)"
@@ -804,7 +889,7 @@ H=(-H 'Content-Type: application/x-www-form-urlencoded;charset=utf-8'
 # that request 400 once its body ends, and the answer is discarded.
 i=0
 while ! grep -q message-done "$d/w" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 2; printf x; i=$((i + 1)); done |
-  curl --parallel "${C[@]}" "${H[@]}" --max-time 130 -o "$d/out" -w '%{stderr}message-done' \
+  curl -q --parallel "${C[@]}" "${H[@]}" --max-time 130 -o "$d/out" -w '%{stderr}message-done' \
     --data-urlencode 'f.req=[null,"[[\"hi\"],null,null]"]' \
     "$U?bl=${bl}&f.sid=${sid}&hl=en&_reqid=$(( RANDOM * 10 + 100000 ))&rt=c" \
     --next "${C[@]}" "${H[@]}" -X POST -T - --max-time 130 -o /dev/null "$U?rt=c" \
@@ -830,7 +915,6 @@ if grep -qiE 'https://[^/"]*google\.[a-z.]+/sorry/' "$d/out" 2>/dev/null; then
 fi
 echo "inconclusive (no reply${errs:+, error ${errs% }})$note"; exit 2
 GEM
-chmod 755 "/usr/local/sbin/$P-gemini-check"
 
 # ---- watchdog ---------------------------------------------------------------
 put "/usr/local/sbin/$P-watchdog" <<'WD'
@@ -865,7 +949,7 @@ set -uo pipefail
 . /etc/default/@P@
 LOG=/var/log/@P@-watchdog.log
 STATE=/var/lib/@P@-watchdog.state
-S=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT}")
+S=(--noproxy "" --socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT}")
 touch "$LOG" 2>/dev/null
 log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
 
@@ -1045,7 +1129,6 @@ fi
 # the next check finds a different tunnel and starts from zero.
 printf "fails=%s\ntunnel=%s\n" "$fails" "$started" > "$STATE"
 WD
-chmod 755 "/usr/local/sbin/$P-watchdog"
 touch "/var/log/$P-watchdog.log"
 
 # ---- management CLI ---------------------------------------------------------
@@ -1061,7 +1144,32 @@ HTTP_PORT="${HTTP_PORT:-8080}"
 PUBLISH_HTTP="${PUBLISH_HTTP:-1}"
 CONF_DIR="${CONF_DIR:-/opt/@P@/config}"
 BIND="${BIND:-127.0.0.1}"
-S=(--socks5-hostname "${BIND}:${SOCKS_PORT}")
+S=(--noproxy "" --socks5-hostname "${BIND}:${SOCKS_PORT}")
+
+require_config() {
+  [ -r /etc/default/@P@ ] || { echo "Run as root with @P@ installed" >&2; exit 1; }
+}
+
+check() {
+  require_config
+  local code
+  if ! code="$(curl -q -sS -o /dev/null --connect-timeout 5 --max-time 12 "${S[@]}" \
+      -w '%{http_code}' https://www.gstatic.com/generate_204)" || [ "$code" != 204 ]; then
+    echo "SOCKS HTTPS probe failed (HTTP ${code:-none}) at ${BIND}:${SOCKS_PORT}" >&2
+    return 4
+  fi
+  echo "SOCKS HTTPS probe passed (HTTP 204) at ${BIND}:${SOCKS_PORT}"
+  /usr/local/sbin/@P@-gemini-check
+}
+
+outbound() {
+  require_config
+  local tag=psiphon-out
+  local instance=@P@
+  if [ "$instance" != vps-psiphon ]; then tag="psiphon-out-${instance#vps-psiphon-}"; fi
+  jq -n --arg tag "$tag" --arg address "$BIND" --argjson port "$SOCKS_PORT" \
+    '{tag: $tag, protocol: "socks", settings: {address: $address, port: $port}}'
+}
 
 # Starts the client on an empty config directory. The client keeps the servers it knows
 # there, and a plain restart kept bringing it back to the same server in the country;
@@ -1112,6 +1220,8 @@ status() {
 
 case "${1:-status}" in
   status) status ;;
+  check) check ;;
+  outbound) outbound ;;
   rotate)
     echo "rotating (fresh tunnel, new exit)…"
     moved="$(/usr/local/sbin/@P@-advance-region 2>/dev/null)"
@@ -1122,8 +1232,11 @@ case "${1:-status}" in
     status ;;
   pool)
     # An empty string is valid — it clears the pool — so test for a MISSING argument.
-    [ $# -ge 2 ] || { echo "usage: @P@ pool '<CC CC …>'   (empty string clears it)"; exit 1; }
+    require_config
+    [ "$#" -eq 2 ] || { echo "usage: @P@ pool '<CC CC …>'   (empty string clears it)" >&2; exit 1; }
     np="$(printf '%s' "$2" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    [[ -z "$np" || "$np" =~ ^[A-Z]{2}(\ [A-Z]{2})*$ ]] ||
+      { echo "pool requires uppercase two-letter country codes" >&2; exit 1; }
     sed -i "s/^REGION_POOL=.*/REGION_POOL='$np'/" /etc/default/@P@
     if [ -n "$np" ]; then
       echo "pool      : $np"
@@ -1136,7 +1249,10 @@ case "${1:-status}" in
       echo "pool cleared — rotations stay in ${EGRESS_REGION:-auto}"
     fi ;;
   region)
-    [ -n "${2:-}" ] || { echo "usage: @P@ region <CC|auto>"; exit 1; }
+    require_config
+    [ "$#" -eq 2 ] || { echo "usage: @P@ region <CC|auto>" >&2; exit 1; }
+    [[ "$2" = auto || "$2" =~ ^[A-Z]{2}$ ]] ||
+      { echo "region requires an uppercase two-letter country code or auto" >&2; exit 1; }
     r="$2"; [ "$r" = auto ] && r=""
     sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$r/" /etc/default/@P@
     EGRESS_REGION="$r"
@@ -1147,10 +1263,14 @@ case "${1:-status}" in
     echo -n "single 50MB : "
     curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{speed_download}\n' "$U" | awk '{printf "%.1f Mbit/s\n", $1*8/1e6}'
     echo -n "4x parallel : "
-    rm -f /tmp/@P@.speed; t0=$(date +%s.%N)
-    for i in 1 2 3 4; do curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> /tmp/@P@.speed & done
+    measurements="$(mktemp)" || exit 1
+    trap 'rm -f "$measurements"' EXIT
+    t0=$(date +%s.%N)
+    for _ in 1 2 3 4; do
+      curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> "$measurements" &
+    done
     wait; t1=$(date +%s.%N)
-    awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' /tmp/@P@.speed ;;
+    awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' "$measurements" ;;
   logs)     docker logs --tail "${2:-50}" "$NAME" ;;
   watchdog) tail -n "${2:-30}" /var/log/@P@-watchdog.log ;;
   uninstall)
@@ -1168,7 +1288,7 @@ case "${1:-status}" in
           /usr/local/sbin/@P@-prestart \
           /usr/local/sbin/@P@-advance-region /usr/local/sbin/@P@-gemini-check \
           /etc/default/@P@ /var/lib/@P@-watchdog.state /var/lib/@P@-watchdog.seen \
-          /var/log/@P@-watchdog.log /tmp/@P@.speed
+          /var/log/@P@-watchdog.log
     rm -rf /opt/@P@
     # Safe while running: bash holds the inode open.
     rm -f /usr/local/sbin/@P@
@@ -1190,10 +1310,9 @@ case "${1:-status}" in
       && echo "note: image $IMAGE kept, something else on this host references it"
     [ -n "$left" ] && { echo "removed, but these remain:$left" >&2; exit 1; }
     echo "removed: units, container, image, config, state, log — and this CLI itself" ;;
-  *) echo "usage: @P@ {status|rotate|region <CC>|pool '<CC CC …>'|speed|logs [n]|watchdog [n]|uninstall}" ;;
+  *) echo "usage: @P@ {status|check|outbound|rotate|region <CC|auto>|pool '<CC CC …>'|speed|logs [n]|watchdog [n]|uninstall}" >&2; exit 1 ;;
 esac
 CLI
-chmod 755 "/usr/local/sbin/$P"
 
 # ---- units ------------------------------------------------------------------
 put "/etc/systemd/system/$P.service" <<'U1'
@@ -1205,7 +1324,7 @@ Requires=docker.service
 [Service]
 ExecStartPre=/usr/local/sbin/@P@-prestart
 ExecStart=/usr/local/sbin/@P@-run
-ExecStop=/usr/bin/docker stop -t 10 @P@
+ExecStop=/usr/local/sbin/@P@-run --stop
 Restart=always
 RestartSec=10
 TimeoutStartSec=0
@@ -1229,7 +1348,7 @@ put "/etc/systemd/system/$P-watchdog.timer" <<'U3'
 Description=Run the @P@ watchdog every 5 minutes
 
 [Timer]
-OnBootSec=5min
+OnActiveSec=5min
 OnUnitActiveSec=5min
 AccuracySec=30s
 
@@ -1238,52 +1357,39 @@ WantedBy=timers.target
 U3
 
 systemctl daemon-reload
-systemctl enable $P.service >/dev/null 2>&1
-# restart, not "enable --now": on a reinstall the service is already active and would
-# keep running with the previous parameters. The restart brings a fresh tunnel, and the
-# watchdog does not carry the old one's failures over to it.
-systemctl restart $P.service
-[ "$WATCHDOG" = 1 ] && systemctl enable --now $P-watchdog.timer
+systemctl enable "$P.service" >/dev/null 2>&1
+systemctl restart "$P.service"
+if [ "$WATCHDOG" = 1 ]; then
+  systemctl enable --now "$P-watchdog.timer"
+else
+  systemctl disable --now "$P-watchdog.timer"
+fi
 
-# ------------------------------------------------------------------- verify --
-say "waiting for the tunnel"
-# Watch the unit, not just the log: with Restart=always a container that cannot start
-# loops as "activating", and waiting on the log alone ends in a silent exit 0.
-TUNNEL_UP=0
-for i in $(seq 1 60); do
-  systemctl is-active --quiet $P.service || break
-  docker logs "$NAME" 2>&1 | grep -q '"noticeType":"Tunnels"' && { TUNNEL_UP=1; break; }
+# A process or a log line alone says nothing about the published SOCKS port.
+say "waiting for HTTPS through SOCKS at $BIND:$SOCKS_PORT"
+deadline=$((SECONDS + 120))
+SOCKS_OK=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ] &&
+     SOCKS_CODE="$(curl -q -s -o /dev/null --connect-timeout 3 --max-time 6 \
+       --noproxy "" --socks5-hostname "$BIND:$SOCKS_PORT" \
+       -w '%{http_code}' https://www.gstatic.com/generate_204)" &&
+     [ "$SOCKS_CODE" = 204 ]; then
+    SOCKS_OK=1
+    break
+  fi
   sleep 2
 done
 
-if [ "$TUNNEL_UP" = 0 ] && ! systemctl is-active --quiet $P.service; then
-  echo >&2
-  printf '\033[1;31mERROR:\033[0m the tunnel never started.\n' >&2
-  journalctl -u $P.service -n 40 --no-pager 2>/dev/null \
-    | grep -iE 'error|failed|cannot|denied' | tail -5 | sed 's/^/    /' >&2
-  # Stopped rather than left hammering docker every 10s while you read this.
-  systemctl stop $P.service >/dev/null 2>&1 || true
-  echo >&2
-  echo "    The service is stopped, not looping. Fix the cause and re-run this" >&2
-  echo "    installer, or '$P uninstall' to remove what was written." >&2
-  exit 1
-fi
-
-if [ "$TUNNEL_UP" = 0 ]; then
-  say "no tunnel after 120s, but the service is alive — leaving it to keep trying"
-  say "watch it with:  $P logs"
-fi
-sleep 3
-echo
-/usr/local/sbin/$P status
 echo
 say "xray outbound:"
-cat <<OUT
-    { "tag": "$OUT_TAG", "protocol": "socks",
-      "settings": { "address": "$BIND", "port": $SOCKS_PORT } }
-OUT
-if [ "${BIND_CHANGED:-0}" = 1 ]; then
-  printf '\033[1;33m    !! this run MOVED the address (%s -> %s), so the outbound above is\n' "$OLD_BIND" "$BIND"
-  printf '       NOT what your panel has. Update it now, or the tunnel carries nothing.\033[0m\n'
+"/usr/local/sbin/$P" outbound
+if [ "$BIND_CHANGED" = 1 ] || { [ -n "$OLD_SOCKS_PORT" ] && [ "$OLD_SOCKS_PORT" != "$SOCKS_PORT" ]; }; then
+  say "Update the Xray outbound from $OLD_BIND:$OLD_SOCKS_PORT to $BIND:$SOCKS_PORT before routing traffic."
 fi
-say "manage with:  $P {status|rotate|region <CC>|pool '<CC CC …>'|speed|logs|uninstall}"
+say "manage with: $P status | $P check | $P logs"
+if [ "$SOCKS_OK" = 0 ]; then
+  journalctl -u "$P.service" -n 15 --no-pager >&2 || true
+  die "the HTTPS probe did not pass. Installation files are in place; see '$P logs' and '$P check'."
+fi
+say "SOCKS HTTPS probe passed (HTTP 204). Run '$P check' to test a Gemini reply."

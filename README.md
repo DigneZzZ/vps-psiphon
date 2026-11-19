@@ -21,39 +21,10 @@ hold both outbounds at once and split traffic by rules.
 > DPI it is both blockable itself and a fingerprint that exposes the server. This
 > belongs on a foreign node you already reach through your own transport.
 
-> ⚠️ **Running the image by hand is not equivalent, and the difference is a public
-> open proxy.** Psiphon listens on `0.0.0.0` inside the container, so the plain
-> `docker run -p 1080:1080` — or the compose snippet you will find alongside the
-> image — publishes SOCKS5, and the HTTP proxy with it, on *every* address the host
-> has, with no authentication. Port 1080 is scanned continuously; an exposed one is
-> found within hours and lands on public open-proxy lists, from where reputation
-> blocklists pick it up — being an open proxy is a listable condition on its own,
-> independent of anything you send. After that, strangers' traffic leaves through
-> your tunnel, on your bandwidth, and any egress filtering you run by port number
-> does not see it: whatever they do is encapsulated inside the tunnel's own
-> connection. This script never publishes on a wildcard of its own accord: it binds
-> either the docker0 gateway (the default) or `127.0.0.1` — both host-private, and
-> neither routable from outside. Which of the two, and why it matters, is under
-> [Where the SOCKS5 is published](#where-the-socks5-is-published). `--bind` takes
-> any other address you hand it, a public one included — that is your call to make,
-> and the access control such an address then needs is yours to add.
->
-> If you use the image by hand regardless, the published ports are what you have to
-> change — both of them, in the compose file the image ships with:
->
-> ```yaml
-> ports:
->   - "127.0.0.1:1080:1080"   # shipped as 1080:1080
->   - "127.0.0.1:8080:8080"   # shipped as 8080:8080
-> ```
->
-> and `-p 127.0.0.1:1080:1080` likewise for the `docker run` line next to it. The
-> address prefix is the entire fix: `SOCKS_PORT` and `HTTP_PORT` stay as they are,
-> because they decide where psiphon listens inside the container, not who may reach
-> it from outside. Delete the 8080 entry altogether if you have no use for the HTTP
-> proxy — an unpublished port cannot be exposed by mistake. Then verify rather than
-> assume, since this is the kind of edit that silently does not apply: `ss -tlnp |
-> grep -E '1080|8080'` must show `127.0.0.1`, never `0.0.0.0` or `[::]`.
+A manual `docker run -p 1080:1080` publishes an unauthenticated SOCKS port on
+all host addresses. Use a specific bind address. A bridge gateway is reachable
+from its attached network. Check access from other networks too if the host
+forwards traffic or runs untrusted containers. [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/)
 
 ## Links
 
@@ -63,17 +34,21 @@ hold both outbounds at once and split traffic by rules.
 
 ## Install
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh)
-```
-
-With an explicit exit country:
+Requires Linux with systemd, Docker Engine, curl, jq, iproute2 and util-linux
+(`flock`). Run the installer as root.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh) --region DE
+curl -fL --proto '=https' -o psiphon_install.sh https://raw.githubusercontent.com/DigneZzZ/vps-psiphon/v1.4.0-geolog.1/psiphon_install.sh
+less psiphon_install.sh
+sudo bash psiphon_install.sh --region DE --bind-loopback
+sudo vps-psiphon check
+sudo vps-psiphon outbound
 ```
 
-Requires root, docker and curl.
+Use `--bind-loopback` when Xray runs on the host or with Docker host networking.
+For Xray on a Docker bridge, use `--bind-docker NETWORK` with the actual network
+name. Choose a Psiphon exit region available to this instance.
+The [Russian Gemini guide](codex/plugin/skills/gemini-psiphon/references/deploy-and-test.md) covers routing, upgrades and rollback.
 
 ### Flags
 
@@ -83,18 +58,20 @@ Requires root, docker and curl.
 | `--device-region CC` | autodetected | region the client reports (cosmetic — the server decides by GeoIP) |
 | `--instance N` | 1 | which tunnel on this host, 1-99; N > 1 adds `-N` to every name — see Several tunnels on one host |
 | `--socks-port N` | 1080+N-1 | SOCKS5 port for xray |
-| `--http-port N` | 8080+N-1 | HTTP proxy port |
+| `--http-port N` | 8080+N-1 | HTTP proxy port. On a fresh install, use `--http` as well to publish it |
 | `--no-http` | — | do not publish the HTTP proxy at all; remembered across reinstalls |
-| `--http` | — | publish it after all — undoes a stored `--no-http` |
+| `--http` | off on fresh installations | publish it after all — undoes a stored `--no-http` |
 | `--deny-regions 'CC…'` | `RU BY IR SY CU KP CN VE` | countries the exit must never be in; checked first, in every mode. Empty disables it |
 | `--bulk-test-mb N` | 4 | size of the watchdog's throughput download, MB — about 35 GB a month at 4. `0` judges the YouTube page instead, at no extra traffic, for a host whose traffic is metered or scarce. Remembered across reinstalls |
 | `--tunnel-pool N` | 1 | legacy: tunnels this instance keeps at once, 1-32 (Psiphon's `TunnelPoolSize`) — see A pool of tunnels in one instance. Remembered across reinstalls |
 | `--impersonate` | off | install curl-impersonate and fetch the Gemini check's page with a browser's TLS handshake, so that a captcha Google shows browsers on the exit is seen and rotates at once — for a node whose Gemini leaves through the tunnel while `www.google.com` does not; see A captcha that cannot be solved. Remembered across reinstalls |
 | `--no-impersonate` | — | turn it off again and remove curl-impersonate |
-| `--bind ADDR` | docker0 gateway | host address the ports are published on |
+| `--bind ADDR` | default bridge gateway or loopback | explicit host IPv4 address |
+| `--bind-docker NETWORK` | — | publish on the IPv4 gateway of the named Docker bridge |
 | `--bind-loopback` | — | publish on `127.0.0.1` instead of the gateway |
-| `--image REF` | `swarupsengupta2007/psiphon:latest` | container image |
-| `--no-watchdog` | — | skip the watchdog |
+| `--image REF` | `swarupsengupta2007/psiphon:latest` | compatible Psiphon Docker image. A fresh install reads its template at `/etc/psiphon/psiphon.config` |
+| `--no-watchdog` | — | disable and stop the watchdog timer |
+| `--watchdog` | on for fresh installs | enable the watchdog timer. Upgrades keep the existing setting unless overridden |
 
 An empty region means auto — the fastest server in any country.
 
@@ -142,9 +119,10 @@ A collision is judged the way the kernel judges it, not by comparing strings: a
 listener on `0.0.0.0` blocks every bind of that port, so a neighbouring container
 published on `0.0.0.0:8080` does collide with our `127.0.0.1:8080`.
 
-Should the container fail to start anyway, the installer reports the actual docker
-error, stops the unit so it is not looping while you read it, and exits non-zero —
-about three seconds from launch, rather than two minutes of nothing.
+The installer waits up to about two minutes for an HTTPS 204 response over
+SOCKS. If the probe fails, it prints recent service logs and returns an error.
+The files and service remain available for diagnosis with `vps-psiphon logs`
+and `vps-psiphon check`.
 
 ## Outbound
 
@@ -167,33 +145,15 @@ Psiphon local proxy does not support it (see Measurements).
 
 ### Where the SOCKS5 is published
 
-Two addresses are supported, and the difference is measurable rather than stylistic:
+On a fresh installation without a bind flag, the installer uses the default
+Docker bridge's IPv4 gateway, with `127.0.0.1` as a fallback. For a dedicated
+Xray network, select it with `--bind-docker NETWORK`. In a bridge container,
+loopback belongs to the container itself.
 
-| | reachable by | carried by |
-|---|---|---|
-| docker0 gateway — default, usually `172.17.0.1` | the host, and containers on the default bridge | the kernel |
-| `127.0.0.1` — `--bind-loopback` | processes on the host only | `docker-proxy`, in userspace |
-
-Docker writes a DNAT rule for every published port, but a loopback destination
-needs `net.ipv4.conf.all.route_localnet`, which docker does not set. On loopback
-that rule therefore never fires — its packet counter sits at zero — and
-`docker-proxy` copies every byte between two sockets in userspace instead. On a
-node carrying ~100 new connections per second that copy measured 0.10 of a core
-sustained and 0.27-0.36 at peak; the same traffic published on the gateway took it
-to exactly 0.00, with throughput unchanged. Bulk transfers hide this — the cost is
-in connection setup, so the busier the node, the worse loopback looks.
-
-Neither address is reachable from the internet. What the gateway costs is that
-other containers on the default bridge reach the tunnel too, which is what
-`--bind-loopback` is for when that matters more than the core does. Those two are
-what the installer chooses between on its own; `--bind ADDR` publishes on any
-address you name instead, and guarding one that is reachable from outside is then
-yours to do.
-
-Moving this on an existing install takes two edits and needs both: re-run the
-installer with the new setting, and change the address in the outbound. The
-installer cannot do the second — the outbound lives in your panel — so it warns
-loudly and reprints the outbound whenever the address moves.
+On an upgrade the installer keeps the existing endpoint unless you select a
+new one. If you change the address or port, update the Xray outbound and verify
+reachability from Xray's network namespace. `vps-psiphon outbound` prints the
+settings for the chosen instance.
 
 Older guides wrap this in a `"servers": [ … ]` array. Xray still parses that form —
 `infra/conf/socks.go` keeps both — but it is V2Ray legacy, no longer in the Xray
@@ -220,7 +180,7 @@ not reach all of your traffic at once — `--instance N` installs another, fully
 separate one:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Chara-Freedom/vps-psiphon/main/psiphon_install.sh) --instance 2 --region NL
+sudo bash psiphon_install.sh --instance 2 --region NL
 ```
 
 Every name gets `-2`: the CLI is `vps-psiphon-2`, the units `vps-psiphon-2.service`
@@ -299,7 +259,9 @@ it. The setting is remembered across reinstalls and applies from the next restar
 
 ```
 vps-psiphon                 state: region, server's country, exit IP, Google's verdict, Gemini's answer, traffic
-vps-psiphon rotate          fresh tunnel → different exit IP
+vps-psiphon outbound        print Xray JSON for this instance
+vps-psiphon check           check HTTPS over SOCKS and a logged-out Gemini response
+vps-psiphon rotate          reconnect the tunnel
 vps-psiphon region JP       change exit country
 vps-psiphon pool 'DE NL FR' countries to rotate through ('' clears it)
 vps-psiphon speed           50 MB single stream + 4 streams aggregate
@@ -309,6 +271,19 @@ vps-psiphon uninstall       remove everything, including this CLI
 ```
 
 A second instance answers to `vps-psiphon-2`, with the same commands.
+
+## Codex plugin
+
+Register this fork as a marketplace and install the bundled skill.
+
+```bash
+codex plugin marketplace add DigneZzZ/vps-psiphon --ref v1.4.0-geolog.1
+codex plugin add gemini-psiphon@dignezzz-vpn
+```
+
+In a new Codex chat, select `Gemini Psiphon`. The source for a standalone
+install is [gemini-psiphon](codex/plugin/skills/gemini-psiphon/). Copy that
+directory to the Codex skills directory to use `$gemini-psiphon` directly.
 
 ## What gets installed
 
@@ -974,32 +949,15 @@ serve them well. An exit server carrying a host's traffic is simply not that cas
 
 ## Pitfalls
 
-- **The `BIND` prefix on the published ports is load-bearing.** Inside the
-  container psiphon listens on `0.0.0.0`, so `-p 1080:1080` with no address prefix
-  publishes an open SOCKS proxy to the internet. The script always supplies one —
-  the docker0 gateway or `127.0.0.1`, both host-private — and never picks a
-  wildcard on its own, though a `--bind` you name is used exactly as given. Keep
-  it in mind if you edit by hand.
-- **A host firewall does not contain a published container port.** Docker's publish
-  is a DNAT rule in `nat/PREROUTING`, which runs before the filter rules ufw
-  manages, so `ufw deny 1080` on an exposed port changes nothing and "the firewall
-  is up" is not evidence the port is closed. Check what is actually listening —
-  `ss -tlnp | grep 1080` should show your `BIND` address, never `0.0.0.0` or `[::]`. If you
-  must leave a port published wider, filter it in the `DOCKER-USER` chain, which
-  docker consults first.
+- **Check the actual port mapping.** `docker port vps-psiphon` should show the
+  intended addresses and ports. Verify reachability from Xray and any untrusted
+  or routed networks on the host. [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/)
+
 - **Before 1.3 an empty region was not auto.** The image's config template carries
   `"EgressRegion": "SG"`, and the image replaces it only with a value that is not
   empty, so an empty `EGRESS_REGION` exited through Singapore. Since 1.3 the launcher
   writes both regions from `/etc/default/vps-psiphon` into `psiphon.config` on every
   start; an empty one is written as empty, which Psiphon reads as any country.
-- **`--bind-loopback` requires the xray container to use host networking.**
-  Loopback exists separately inside every namespace, so from a bridged container
-  `127.0.0.1` names that container, not the tunnel. The default gateway address
-  carries no such ambiguity and needs nothing changed about xray. The script checks
-  and warns.
-- **Moving the published address is two edits, not one.** The installer rewrites
-  its own files; the outbound lives in your panel, out of its reach. Until both are
-  done the tunnel is up, every check reads green, and it carries nothing.
 - **`TargetServerEntry`** in the Psiphon config pins one specific server, but it
   collapses the pool to size 1 with no failover and removes the ability to move
   off an unusable exit. Only the region is pinned here.
@@ -1020,4 +978,4 @@ running, and the image stays while any instance still uses it.
 
 ## Contributing
 
-Pull requests go to the `dev` branch; `main` is brought up to `dev` at each release.
+This fork tracks [Chara-Freedom/vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon).

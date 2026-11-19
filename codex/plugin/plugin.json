@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gemini-psiphon",
+  "version": "1.0.0",
+  "description": "Настройка Psiphon и маршрутизации Gemini и Claude на Linux с Xray и Remnawave.",
+  "repository": "https://github.com/DigneZzZ/vps-psiphon",
+  "license": "MIT",
+  "author": { "name": "DigneZzZ" },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Gemini Psiphon",
+        "shortDescription": "Маршруты Gemini и Claude",
+        "longDescription": "Инструкция по установке Psiphon, выборочной маршрутизации Xray и проверке Gemini и Claude через VPN-клиент.",
+        "developerName": "DigneZzZ",
+        "category": "Developer Tools",
+        "defaultPrompt": "Проверьте, как настроить маршрут Gemini через Psiphon для моей ноды Xray."
+      }
+    }
+  }
+}

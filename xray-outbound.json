@@ -1,13 +1,9 @@
 // psiphon-out — локальный SOCKS5, который поднимает vps-psiphon
 //
 // port    — должен совпадать с SOCKS_PORT из /etc/default/vps-psiphon (по умолчанию 1080)
-// address — должен совпадать с BIND из /etc/default/vps-psiphon. По умолчанию это
-//           шлюз docker0 (обычно 172.17.0.1): его видно и с хоста, и из bridge-
-//           контейнеров, и трафик по нему несёт ядро, а не docker-proxy.
-//           При установке с --bind-loopback здесь ставится 127.0.0.1, и тогда
-//           контейнер xray обязан быть в host-сети — иначе этот адрес указывает
-//           на сам контейнер xray. Установщик печатает готовый блок с нужным
-//           адресом, лучше копировать его
+// address — возьмите адрес из вывода vps-psiphon outbound.
+//           Для Xray на хосте подходит loopback. Для Xray в Docker bridge
+//           укажите адрес шлюза, доступный из сети Xray.
 // TCP-only — локальный прокси Psiphon отвечает REP=7 COMMAND NOT SUPPORTED
 //            на UDP ASSOCIATE, UDP сюда направлять нельзя
 

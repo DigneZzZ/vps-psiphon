@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gemini и Claude через Psiphon"
+  short_description: "Маршруты и проверки Gemini и Claude на VPS"
+  default_prompt: "Используй $gemini-psiphon, чтобы проверить и настроить доступ к запрошенным сервисам Gemini или Claude/Anthropic на указанных VPS с Xray или Remnawave."
